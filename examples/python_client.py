@@ -1036,6 +1036,146 @@ def main() -> None:
                for c in diff["evidence_changes"]["own_events"]
                if c["change"] == "changed"})
 
+        # ==================== 质控：测温盲区查询 ====================
+        # 独立演示货物：车载读数只在当前装卸窗口内生效，同刻自有测温优先，
+        # 被生效探头故障覆盖的车载读数不构成覆盖；温度是否越限与覆盖无关。
+        gap_cargo = "COLD-GAP-PY"
+        api.post(
+            "/cargo",
+            json={
+                "cargo_id": gap_cargo,
+                "started_at": "2026-11-01T08:00:00+08:00",
+                "temp_upper_limit": "4.0",
+                "initial_holder": "北京冷库",
+            },
+        )
+        api.post("/trips", json={"trip_id": "TRUCK-GPY", "vehicle_no": "京A-GAP"})
+        # 当前装卸窗口 10:00-18:00（左闭右开）
+        api.post(
+            "/trips/TRUCK-GPY/manifest",
+            json={"items": [{
+                "cargo_id": gap_cargo,
+                "loaded_at": "2026-11-01T10:00:00+08:00",
+                "unloaded_at": "2026-11-01T18:00:00+08:00",
+            }]},
+        )
+        for rid, at, temp in (
+            ("cg-py-vr1", "2026-11-01T10:00:00+08:00", "9"),    # 越限但仍覆盖
+            ("cg-py-vr2", "2026-11-01T13:00:00+08:00", "2.5"),
+            ("cg-py-vr3", "2026-11-01T18:00:00+08:00", "2.5"),  # 卸货点，不适用
+        ):
+            api.post(
+                "/vehicle-readings",
+                json={"reading_id": rid, "trip_id": "TRUCK-GPY",
+                      "read_at": at, "temperature": temp},
+            )
+        api.post(
+            "/events",
+            json={"event_id": "cg-py-e1", "cargo_id": gap_cargo,
+                  "occurred_at": "2026-11-01T11:30:00+08:00",
+                  "temperature": "3.0"},
+        )
+        api.post(
+            "/events",
+            json={"event_id": "cg-py-h1", "cargo_id": gap_cargo,
+                  "occurred_at": "2026-11-01T12:00:00+08:00",
+                  "giver": "北京冷库", "receiver": "上海冷库"},
+        )
+
+        show(
+            "测温盲区（窗 09:00-19:00，阈值 1 小时）",
+            api.get(
+                f"/cargo/{gap_cargo}/coverage-gaps",
+                params={
+                    "start_at": "2026-11-01T09:00:00+08:00",
+                    "end_at": "2026-11-01T19:00:00+08:00",
+                    "max_gap_seconds": 3600,
+                },
+            ),
+        )
+        # 严格长于阈值：阈值 2h 时 11:30-13:00（90 分钟）不再是盲区
+        show(
+            "阈值放宽到 2 小时",
+            api.get(
+                f"/cargo/{gap_cargo}/coverage-gaps",
+                params={
+                    "start_at": "2026-11-01T09:00:00+08:00",
+                    "end_at": "2026-11-01T19:00:00+08:00",
+                    "max_gap_seconds": 7200,
+                },
+            ),
+        )
+        # 探头故障隔离 13:00 读数 -> 盲区重算；撤销后再重算（原记录不改）
+        api.post(
+            "/trips/TRUCK-GPY/probe-faults",
+            json={
+                "fault_id": "cg-py-f1",
+                "fault_start": "2026-11-01T12:30:00+08:00",
+                "fault_end": "2026-11-01T13:30:00+08:00",
+                "reason": "探头漂移",
+            },
+        )
+        quarantined = api.get(
+            f"/cargo/{gap_cargo}/coverage-gaps",
+            params={
+                "start_at": "2026-11-01T09:00:00+08:00",
+                "end_at": "2026-11-01T19:00:00+08:00",
+                "max_gap_seconds": 3600,
+            },
+        ).json()
+        print("\n== 故障覆盖 13:00 读数后的盲区 ==")
+        print("   ", [(g["start"][11:16], g["end"][11:16])
+                       for g in quarantined["gaps"]])
+        api.post(
+            "/trips/TRUCK-GPY/probe-faults/revoke",
+            json={"revocation_id": "cg-py-rv1", "fault_id": "cg-py-f1",
+                  "expected_version": 0},
+        )
+        restored = api.get(
+            f"/cargo/{gap_cargo}/coverage-gaps",
+            params={
+                "start_at": "2026-11-01T09:00:00+08:00",
+                "end_at": "2026-11-01T19:00:00+08:00",
+                "max_gap_seconds": 3600,
+            },
+        ).json()
+        print("\n== 撤销故障后读数恢复，盲区重算 ==")
+        print("   ", [(g["start"][11:16], g["end"][11:16])
+                       for g in restored["gaps"]])
+        # 测温值更正只改温度，不改变覆盖几何
+        api.post(
+            "/corrections",
+            json={
+                "correction_id": "cg-py-corr1",
+                "target_type": "vehicle_reading",
+                "target_id": "cg-py-vr1",
+                "expected_version": 0,
+                "new_temperature": "2.0",
+            },
+        )
+        show(
+            "测温更正后再次查询（盲区不变）",
+            api.get(
+                f"/cargo/{gap_cargo}/coverage-gaps",
+                params={
+                    "start_at": "2026-11-01T09:00:00+08:00",
+                    "end_at": "2026-11-01T19:00:00+08:00",
+                    "max_gap_seconds": 3600,
+                },
+            ),
+        )
+        show(
+            "非法：阈值非正（422 invalid_max_gap）",
+            api.get(
+                f"/cargo/{gap_cargo}/coverage-gaps",
+                params={
+                    "start_at": "2026-11-01T09:00:00+08:00",
+                    "end_at": "2026-11-01T19:00:00+08:00",
+                    "max_gap_seconds": 0,
+                },
+            ),
+        )
+
 
 if __name__ == "__main__":
     main()

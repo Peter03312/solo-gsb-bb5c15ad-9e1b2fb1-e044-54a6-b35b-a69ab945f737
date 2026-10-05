@@ -1063,3 +1063,104 @@ import json,sys
 c = json.load(sys.stdin)["content"]
 print("    原封存包不变：标准版本 =", [s["version"] for s in c["temp_standards"]],
       "m1 上限 =", next(e["temp_upper_limit"] for e in c["own_events"] if e["event_id"]=="sc2-m1"))'
+
+echo
+echo "================ 本轮新增：质控测温盲区查询 ================"
+# 独立演示货物 CG（初始保管方 北京冷库），配一个车次的车载读数
+CG="COLD-GAP-1"
+curl -sS -o /dev/null -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$CG\",
+  \"started_at\": \"2026-11-01T08:00:00+08:00\",
+  \"temp_upper_limit\": \"4.0\",
+  \"initial_holder\": \"北京冷库\"
+}"
+curl -sS -o /dev/null -X POST "$BASE/trips" -H 'Content-Type: application/json' -d \
+  '{"trip_id":"TRUCK-G","vehicle_no":"京A-GAP"}'
+# 当前装卸窗口 10:00-18:00（左闭右开）：10:00 的读数在车、18:00 的已下车
+curl -sS -o /dev/null -X POST "$BASE/trips/TRUCK-G/manifest" \
+  -H 'Content-Type: application/json' -d '{"items": [{
+    "cargo_id": "'$CG'",
+    "loaded_at": "2026-11-01T10:00:00+08:00",
+    "unloaded_at": "2026-11-01T18:00:00+08:00"}]}'
+# 车载读数：10:00 高温（越限但照样覆盖）、13:00、18:00（卸货点，不适用）
+for body in \
+  '{"reading_id":"cg-vr1","trip_id":"TRUCK-G","read_at":"2026-11-01T10:00:00+08:00","temperature":"9"}' \
+  '{"reading_id":"cg-vr2","trip_id":"TRUCK-G","read_at":"2026-11-01T13:00:00+08:00","temperature":"2.5"}' \
+  '{"reading_id":"cg-vr3","trip_id":"TRUCK-G","read_at":"2026-11-01T18:00:00+08:00","temperature":"2.5"}'; do
+  curl -sS -o /dev/null -X POST "$BASE/vehicle-readings" \
+    -H 'Content-Type: application/json' -d "$body"
+done
+# 自有测温 11:30（与任何车载点不同刻）；交接 12:00 北京冷库 -> 上海冷库
+curl -sS -o /dev/null -X POST "$BASE/events" -H 'Content-Type: application/json' -d \
+  '{"event_id":"cg-e1","cargo_id":"COLD-GAP-1","occurred_at":"2026-11-01T11:30:00+08:00","temperature":"3.0"}'
+curl -sS -o /dev/null -X POST "$BASE/events" -H 'Content-Type: application/json' -d \
+  '{"event_id":"cg-h1","cargo_id":"COLD-GAP-1","occurred_at":"2026-11-01T12:00:00+08:00","giver":"北京冷库","receiver":"上海冷库"}'
+
+echo "80) 测温盲区：窗 09:00-19:00、阈值 1 小时"
+echo "    有效锚点：10:00 车载（越限仍覆盖）/ 11:30 自有 / 13:00 车载；18:00 已下车不计"
+echo "    盲区：10:00-11:30（90 分钟）、11:30-13:00（90 分钟，跨 12:00 交接，交接点归接收方）、13:00-19:00"
+echo "    （09:00-10:00 恰好 1 小时，严格长于阈值才是盲区，故不计）"
+curl -sS -G "$BASE/cargo/$CG/coverage-gaps" \
+  --data-urlencode "start_at=2026-11-01T09:00:00+08:00" \
+  --data-urlencode "end_at=2026-11-01T19:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=3600" | python3 -m json.tool; echo
+
+echo "81) 阈值放宽到 2 小时：11:30-13:00 恰好 90 分钟不再是盲区"
+curl -sS -G "$BASE/cargo/$CG/coverage-gaps" \
+  --data-urlencode "start_at=2026-11-01T09:00:00+08:00" \
+  --data-urlencode "end_at=2026-11-01T19:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=7200" \
+  | python3 -c 'import json,sys; print("   ", [(g["start"][11:16],g["end"][11:16]) for g in json.load(sys.stdin)["gaps"]])'
+
+echo "82) 登记探头故障覆盖 13:00 -> cg-vr2 被隔离，11:30-19:00 并为一段盲区"
+curl -sS -o /dev/null -X POST "$BASE/trips/TRUCK-G/probe-faults" \
+  -H 'Content-Type: application/json' -d '{
+    "fault_id":"cg-f1",
+    "fault_start":"2026-11-01T12:30:00+08:00",
+    "fault_end":"2026-11-01T13:30:00+08:00",
+    "reason":"探头漂移"}'
+curl -sS -G "$BASE/cargo/$CG/coverage-gaps" \
+  --data-urlencode "start_at=2026-11-01T09:00:00+08:00" \
+  --data-urlencode "end_at=2026-11-01T19:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=3600" \
+  | python3 -c 'import json,sys; print("    故障期盲区：", [(g["start"][11:16],g["end"][11:16]) for g in json.load(sys.stdin)["gaps"]])'
+
+echo "83) 撤销故障 -> cg-vr2 恢复，盲区按当前状态重算（原记录不改）"
+curl -sS -o /dev/null -X POST "$BASE/trips/TRUCK-G/probe-faults/revoke" \
+  -H 'Content-Type: application/json' -d '{"revocation_id":"cg-rv1","fault_id":"cg-f1","expected_version":0}'
+curl -sS -G "$BASE/cargo/$CG/coverage-gaps" \
+  --data-urlencode "start_at=2026-11-01T09:00:00+08:00" \
+  --data-urlencode "end_at=2026-11-01T19:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=3600" \
+  | python3 -c 'import json,sys; print("    撤销后盲区：", [(g["start"][11:16],g["end"][11:16]) for g in json.load(sys.stdin)["gaps"]])'
+
+echo "84) 测温值更正不改变覆盖：把 cg-vr1 的 9℃ 更正为 2℃，盲区几何不变"
+curl -sS -o /dev/null -X POST "$BASE/corrections" -H 'Content-Type: application/json' -d '{
+  "correction_id":"cg-corr1","target_type":"vehicle_reading",
+  "target_id":"cg-vr1","expected_version":0,"new_temperature":"2.0"}'
+curl -sS -G "$BASE/cargo/$CG/coverage-gaps" \
+  --data-urlencode "start_at=2026-11-01T09:00:00+08:00" \
+  --data-urlencode "end_at=2026-11-01T19:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=3600" \
+  | python3 -c 'import json,sys; print("    更正后盲区：", [(g["start"][11:16],g["end"][11:16]) for g in json.load(sys.stdin)["gaps"]])'
+
+echo "85) 错误示例：货物不存在 / 起止非法 / 缺时区 / 阈值非正 / 缺参数"
+curl -sS -G "$BASE/cargo/NO-SUCH-CARGO/coverage-gaps" \
+  --data-urlencode "start_at=2026-11-01T09:00:00+08:00" \
+  --data-urlencode "end_at=2026-11-01T19:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=3600"; echo
+curl -sS -G "$BASE/cargo/$CG/coverage-gaps" \
+  --data-urlencode "start_at=2026-11-01T19:00:00+08:00" \
+  --data-urlencode "end_at=2026-11-01T09:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=3600"; echo
+curl -sS -G "$BASE/cargo/$CG/coverage-gaps" \
+  --data-urlencode "start_at=2026-11-01T09:00:00" \
+  --data-urlencode "end_at=2026-11-01T19:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=3600"; echo
+curl -sS -G "$BASE/cargo/$CG/coverage-gaps" \
+  --data-urlencode "start_at=2026-11-01T09:00:00+08:00" \
+  --data-urlencode "end_at=2026-11-01T19:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=0"; echo
+curl -sS -G "$BASE/cargo/$CG/coverage-gaps" \
+  --data-urlencode "start_at=2026-11-01T09:00:00+08:00" \
+  --data-urlencode "end_at=2026-11-01T19:00:00+08:00"; echo

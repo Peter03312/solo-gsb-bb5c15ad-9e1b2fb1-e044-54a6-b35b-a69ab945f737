@@ -847,6 +847,73 @@ class SimultaneousExcursionReport(BaseModel):
     )
 
 
+# ----------------------------------------------------- 质控：测温盲区查询
+
+
+class GapReadingRef(BaseModel):
+    """盲区端点处的有效测温读数来源（端点来自查询边界时整体为 null）。"""
+
+    occurred_at: datetime = Field(..., description="读数时刻（UTC）")
+    source: str = Field(
+        ..., description="读数来源：own=货物自有测温；vehicle=车载读数"
+    )
+    event_id: str | None = Field(None, description="自有测温事件ID（车载点为 null）")
+    reading_id: str | None = Field(None, description="车载读数ID（自有点为 null）")
+    trip_id: str | None = Field(None, description="车载读数所属车次（自有点为 null）")
+
+
+class GapCustodySegment(BaseModel):
+    """盲区内按交接时刻切分的一段保管方区间（左闭右开，正长度）。"""
+
+    start: datetime = Field(..., description="片段起点（含，UTC）")
+    end: datetime = Field(..., description="片段终点（不含，UTC）")
+    responsible_party: str = Field(
+        ...,
+        description="该片段保管方；交接点归接收方（交接时刻起的片段归接收方）",
+    )
+
+
+class CoverageGapOut(BaseModel):
+    """一段测温盲区：[start, end) 内无任何有效测温，且时长严格大于阈值。"""
+
+    start: datetime = Field(..., description="盲区起点（含，UTC）")
+    end: datetime = Field(..., description="盲区终点（不含，UTC）")
+    duration_seconds: float = Field(
+        ..., description="盲区时长（秒）= end - start，严格大于阈值"
+    )
+    start_reading: GapReadingRef | None = Field(
+        ...,
+        description="起点锚点读数（窗外的上一笔有效读数不计；起点为查询边界"
+        "或窗内此前无有效读数时为 null）",
+    )
+    end_reading: GapReadingRef | None = Field(
+        ...,
+        description="终点锚点读数（窗外的下一笔有效读数不计；终点为查询边界"
+        "或窗内此后无有效读数时为 null）",
+    )
+    custody_segments: list[GapCustodySegment] = Field(
+        ...,
+        description="按交接时刻切分的保管方片段（交接点归接收方）；"
+        "盲区跨交接时多段，否则单段",
+    )
+
+
+class CoverageGapReport(BaseModel):
+    """一票货物的测温盲区查询结果（盲区按时间升序，互不重叠）。"""
+
+    cargo_id: str
+    start_at: datetime = Field(..., description="查询窗起点（含，UTC）")
+    end_at: datetime = Field(..., description="查询窗终点（不含，UTC）")
+    max_gap_seconds: float = Field(
+        ..., description="生效的最大允许无有效测温时长（秒，正数）"
+    )
+    gaps: list[CoverageGapOut] = Field(
+        ...,
+        description="严格长于阈值的无有效测温间隔；窗内无有效读数时整窗按"
+        "同一规则判定；无盲区为空列表",
+    )
+
+
 # ----------------------------------------------------- 测温值更正
 
 

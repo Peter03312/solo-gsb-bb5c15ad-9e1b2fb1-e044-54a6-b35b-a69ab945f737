@@ -4,7 +4,7 @@
 一键启动    : docker compose up --build  （见 README）
 """
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from fastapi import Depends, FastAPI, Request
@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app import (
     chain,
     correction_crud,
+    coverage_crud,
     crud,
     evidence_crud,
     faults as faults_mod,
@@ -119,6 +120,10 @@ from app.schemas import (
     VehicleReadingReplay,
     SimultaneousExcursionReport,
     SimultaneousExcursionSegment,
+    CoverageGapOut,
+    CoverageGapReport,
+    GapCustodySegment,
+    GapReadingRef,
 )
 from app.timeutil import ensure_utc
 
@@ -1264,6 +1269,115 @@ def trip_simultaneous_excursions(
                 cargo_ids=list(seg.cargo_ids),
             )
             for seg in segments
+        ],
+    )
+
+
+def _parse_max_gap(raw: str | None) -> timedelta:
+    """最大允许无有效测温时长（秒）：必填、正数（可带小数）。"""
+    if raw is None:
+        raise crud.ApiError(
+            422,
+            "missing_parameter",
+            "缺少必填参数 max_gap_seconds：最大允许无有效测温时长（秒，正数）",
+        )
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        raise crud.ApiError(
+            422,
+            "invalid_max_gap",
+            f"参数 max_gap_seconds={raw!r} 非法：必须为正数（秒，可带小数）",
+        )
+    if not (seconds > 0) or seconds in (float("inf"), float("-inf")):
+        raise crud.ApiError(
+            422,
+            "invalid_max_gap",
+            f"参数 max_gap_seconds={raw} 非法：必须为正数（秒，可带小数）",
+        )
+    return timedelta(seconds=seconds)
+
+
+def _gap_reading_ref(ref) -> GapReadingRef | None:
+    if ref is None:
+        return None
+    return GapReadingRef(
+        occurred_at=ref.occurred_at,
+        source=ref.source,
+        event_id=ref.event_id,
+        reading_id=ref.reading_id,
+        trip_id=ref.trip_id,
+    )
+
+
+@app.get(
+    "/cargo/{cargo_id}/coverage-gaps",
+    response_model=CoverageGapReport,
+    tags=["质控查询"],
+    responses={
+        404: {"description": "货物不存在"},
+        422: {"description": "查询窗非法（终点不晚于起点 / 缺时区）或阈值非正"},
+    },
+)
+def cargo_coverage_gaps(
+    cargo_id: str,
+    start_at: str | None = None,
+    end_at: str | None = None,
+    max_gap_seconds: str | None = None,
+    db: Session = Depends(get_db),
+) -> CoverageGapReport:
+    """质控：按货物编号、带时区查询起止时刻与最大允许无有效测温时长查看测温盲区。
+
+    仅取查询窗 ``[start_at, end_at)`` 内该货物**自有测温**与**读数时刻落在
+    当前装卸窗口**（左闭右开）、**未被生效探头故障隔离**的车载读数；同刻
+    自有测温优先（被取代车载点不构成覆盖），温度是否越限不影响覆盖。以查询
+    边界与窗内相邻有效读数时刻划分间隔，**严格长于** ``max_gap_seconds`` 的
+    间隔列为盲区（相等不算）；窗内无有效读数时整窗按同一规则处理。窗外读数
+    不作为锚点（盲区端点读数来源在边界来自查询窗时为空）。每段盲区给出起止、
+    时长、两端读数来源，并按盲区内部的交接时刻列出保管方片段（交接点归
+    接收方）。晚到读数 / 装卸窗口更正 / 故障撤销后按当前状态重算、不改原
+    记录；测温值更正不改变覆盖。同一次查询基于一致的已提交数据视图
+    （PostgreSQL 下 REPEATABLE READ 快照）。
+    """
+    if start_at is None:
+        raise crud.ApiError(
+            422,
+            "missing_parameter",
+            "缺少必填参数 start_at：带时区的查询起点（ISO 8601）",
+        )
+    if end_at is None:
+        raise crud.ApiError(
+            422,
+            "missing_parameter",
+            "缺少必填参数 end_at：带时区的查询终点（ISO 8601，严格晚于起点）",
+        )
+    start = _parse_aware_datetime(start_at, "start_at")
+    end = _parse_aware_datetime(end_at, "end_at")
+    max_gap = _parse_max_gap(max_gap_seconds)
+
+    _, gaps = coverage_crud.query_coverage_gaps(db, cargo_id, start, end, max_gap)
+    return CoverageGapReport(
+        cargo_id=cargo_id,
+        start_at=start,
+        end_at=end,
+        max_gap_seconds=max_gap.total_seconds(),
+        gaps=[
+            CoverageGapOut(
+                start=g.start,
+                end=g.end,
+                duration_seconds=g.duration_seconds,
+                start_reading=_gap_reading_ref(g.start_reading),
+                end_reading=_gap_reading_ref(g.end_reading),
+                custody_segments=[
+                    GapCustodySegment(
+                        start=s.start,
+                        end=s.end,
+                        responsible_party=s.party,
+                    )
+                    for s in g.custody_segments
+                ],
+            )
+            for g in gaps
         ],
     )
 
