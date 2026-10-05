@@ -4,7 +4,7 @@
 一键启动    : docker compose up --build  （见 README）
 """
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from fastapi import Depends, FastAPI, Request
@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import (
+    blindspots,
     chain,
     correction_crud,
     crud,
@@ -119,6 +120,10 @@ from app.schemas import (
     VehicleReadingReplay,
     SimultaneousExcursionReport,
     SimultaneousExcursionSegment,
+    BlindSpotReading,
+    BlindSpotCustodyPiece,
+    BlindSpotItem,
+    CargoBlindSpotsReport,
 )
 from app.timeutil import ensure_utc
 
@@ -1264,6 +1269,132 @@ def trip_simultaneous_excursions(
                 cargo_ids=list(seg.cargo_ids),
             )
             for seg in segments
+        ],
+    )
+
+
+# ---------------------------------------------------------------- 质控：测温盲区查询
+
+
+def _parse_max_gap(raw: str | None) -> timedelta:
+    """最大允许无有效测温时长（秒，正数）。
+
+    接受正数（秒，可为小数）；缺失、非数字或非正（<=0）一律
+    422 ``invalid_gap_threshold``。
+    """
+    if raw is None:
+        raise crud.ApiError(
+            422,
+            "missing_parameter",
+            "缺少必填参数 max_gap_seconds：最大允许无有效测温时长（秒，正数）",
+        )
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise crud.ApiError(
+            422,
+            "invalid_gap_threshold",
+            f"参数 max_gap_seconds={raw!r} 非法：必须为正数（秒，可为小数）",
+        )
+    if not (value > 0) or value in (float("inf"), float("-inf")):
+        raise crud.ApiError(
+            422,
+            "invalid_gap_threshold",
+            f"参数 max_gap_seconds={value} 非法：必须为正的有限时长（秒）",
+        )
+    return timedelta(seconds=value)
+
+
+@app.get(
+    "/cargo/{cargo_id}/blind-spots",
+    response_model=CargoBlindSpotsReport,
+    tags=["质控查询"],
+    responses={
+        404: {"description": "货物不存在"},
+        422: {"description": "查询窗非法（终点不晚于起点 / 缺时区）或阈值非正"},
+    },
+)
+def cargo_blind_spots(
+    cargo_id: str,
+    start_at: str | None = None,
+    end_at: str | None = None,
+    max_gap_seconds: str | None = None,
+    db: Session = Depends(get_db),
+) -> CargoBlindSpotsReport:
+    """质控：按货物编号与带时区查询窗查看**测温盲区**。
+
+    仅取查询窗内该货物**自有测温**与读数时刻落在其**当前装卸窗口**、未被
+    生效探头故障隔离的车载读数（同刻自有测温优先；温度是否越限不影响覆盖）。
+    以查询边界和相邻有效读数时刻划分间隔，**严格长于** ``max_gap_seconds``
+    的间隔列为盲区；无有效读数时整窗按同一规则处理。每段给出起止、时长、
+    两端读数来源（边界端为 null），并按货物自有交接时刻列出保管方片段
+    （交接点归接收方）。晚到读数、装卸窗口更正与故障撤销后按当前状态重算，
+    不改原记录；测温值更正不改变覆盖。同一次查询基于一致的已提交数据视图
+    （PostgreSQL 下 REPEATABLE READ 快照）。
+    """
+    if start_at is None:
+        raise crud.ApiError(
+            422,
+            "missing_parameter",
+            "缺少必填参数 start_at：带时区的查询起点（ISO 8601）",
+        )
+    if end_at is None:
+        raise crud.ApiError(
+            422,
+            "missing_parameter",
+            "缺少必填参数 end_at：带时区的查询终点（ISO 8601，严格晚于起点）",
+        )
+    start = _parse_aware_datetime(start_at, "start_at")
+    end = _parse_aware_datetime(end_at, "end_at")
+    if end <= start:
+        raise crud.ApiError(
+            422,
+            "invalid_query_window",
+            f"查询窗非法：终点 {end.isoformat()} 必须严格晚于起点 "
+            f"{start.isoformat()}",
+        )
+    max_gap = _parse_max_gap(max_gap_seconds)
+
+    _cargo, spots = blindspots.query_cargo_blind_spots(
+        db, cargo_id, start, end, max_gap
+    )
+
+    def _reading(ref):
+        return (
+            BlindSpotReading(
+                at=ref.at,
+                source=ref.source,
+                event_id=ref.event_id,
+                reading_id=ref.reading_id,
+                trip_id=ref.trip_id,
+            )
+            if ref is not None
+            else None
+        )
+
+    return CargoBlindSpotsReport(
+        cargo_id=cargo_id,
+        start_at=start,
+        end_at=end,
+        max_gap_seconds=max_gap.total_seconds(),
+        blind_spots=[
+            BlindSpotItem(
+                start=spot.start,
+                end=spot.end,
+                duration_seconds=spot.duration_seconds,
+                start_reading=_reading(spot.start_reading),
+                end_reading=_reading(spot.end_reading),
+                custody_pieces=[
+                    BlindSpotCustodyPiece(
+                        start=piece.start,
+                        end=piece.end,
+                        duration_seconds=piece.duration_seconds,
+                        responsible_party=piece.responsible_party,
+                    )
+                    for piece in spot.custody_pieces
+                ],
+            )
+            for spot in spots
         ],
     )
 

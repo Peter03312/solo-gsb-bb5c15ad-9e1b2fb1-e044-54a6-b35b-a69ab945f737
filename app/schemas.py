@@ -847,6 +847,71 @@ class SimultaneousExcursionReport(BaseModel):
     )
 
 
+# ----------------------------------------------------- 质控：测温盲区查询
+
+
+class BlindSpotReading(BaseModel):
+    """盲区一端的有效测温读数坐标（查询边界端为空对象各字段为 null）。"""
+
+    at: datetime = Field(..., description="读数时刻（UTC）")
+    source: str = Field(
+        ..., description="读数来源：own=货物自有测温；vehicle=车载读数"
+    )
+    event_id: str | None = Field(..., description="自有测温事件ID（车载为 null）")
+    reading_id: str | None = Field(..., description="车载读数ID（自有为 null）")
+    trip_id: str | None = Field(..., description="车载读数所属车次（自有为 null）")
+
+
+class BlindSpotCustodyPiece(BaseModel):
+    """盲区按交接时刻切出的一个保管方片段（左闭右开，交接点归接收方）。"""
+
+    start: datetime = Field(..., description="片段起点（含，UTC）")
+    end: datetime = Field(..., description="片段终点（不含，UTC）")
+    duration_seconds: float = Field(
+        ..., description="片段时长（秒）：end - start"
+    )
+    responsible_party: str = Field(..., description="该片段的保管方")
+
+
+class BlindSpotItem(BaseModel):
+    """一段测温盲区：[start, end) 内没有任何有效测温读数，且时长严格超阈。"""
+
+    start: datetime = Field(..., description="盲区起点（含，UTC；查询边界或读数时刻）")
+    end: datetime = Field(..., description="盲区终点（不含，UTC；查询边界或读数时刻）")
+    duration_seconds: float = Field(
+        ..., description="盲区时长（秒）：end - start，严格大于阈值"
+    )
+    start_reading: BlindSpotReading | None = Field(
+        ...,
+        description="盲区左端的有效读数坐标；左端为查询边界（窗外 / 无读数）时为 null",
+    )
+    end_reading: BlindSpotReading | None = Field(
+        ...,
+        description="盲区右端的有效读数坐标；右端为查询边界（窗外 / 无读数）时为 null",
+    )
+    custody_pieces: list[BlindSpotCustodyPiece] = Field(
+        ...,
+        description="按货物自有交接时刻切分的保管方片段（交接点归接收方，"
+        "不含零长度片段）；无交接时为单片段",
+    )
+
+
+class CargoBlindSpotsReport(BaseModel):
+    """单票货物的测温盲区查询结果（盲区按时间升序、互不重叠）。"""
+
+    cargo_id: str
+    start_at: datetime = Field(..., description="查询窗起点（含）")
+    end_at: datetime = Field(..., description="查询窗终点（不含）")
+    max_gap_seconds: float = Field(
+        ..., description="生效的最大允许无有效测温时长（秒，正值）"
+    )
+    blind_spots: list[BlindSpotItem] = Field(
+        ...,
+        description="严格长于阈值的无有效测温间隔（查询边界与相邻有效读数时刻"
+        "划分）；无有效读数时整窗按同一规则判定；无盲区时为空列表",
+    )
+
+
 # ----------------------------------------------------- 测温值更正
 
 

@@ -1036,6 +1036,91 @@ def main() -> None:
                for c in diff["evidence_changes"]["own_events"]
                if c["change"] == "changed"})
 
+        # ------------------------------------------------ 测温盲区查询
+        bc, bt = "C-BLIND-PY", "T-BLIND-PY"
+        api.post(
+            "/cargo",
+            json={
+                "cargo_id": bc, "started_at": "2026-10-11T06:00:00+08:00",
+                "temp_upper_limit": "4", "initial_holder": "北京冷库",
+            },
+        )
+        api.post("/trips", json={"trip_id": bt, "vehicle_no": "京B-盲"})
+        api.post(
+            f"/trips/{bt}/manifest",
+            json={"items": [{
+                "cargo_id": bc,
+                "loaded_at": "2026-10-11T08:00:00+08:00",
+                "unloaded_at": "2026-10-11T18:00:00+08:00",
+            }]},
+        )
+        api.post("/vehicle-readings", json={
+            "reading_id": "pbr-0", "trip_id": bt,
+            "read_at": "2026-10-11T08:00:00+08:00", "temperature": "3",
+        })
+        # 09:30 的读数随后会被生效探头故障隔离，不计覆盖
+        api.post("/vehicle-readings", json={
+            "reading_id": "pbr-q", "trip_id": bt,
+            "read_at": "2026-10-11T09:30:00+08:00", "temperature": "3",
+        })
+        api.post(f"/trips/{bt}/probe-faults", json={
+            "fault_id": "pbf-1",
+            "fault_start": "2026-10-11T09:00:00+08:00",
+            "fault_end": "2026-10-11T10:00:00+08:00",
+            "reason": "探头校准漂移",
+        })
+        # 12:30 同刻自有测温优先，车载读数即使不越限也被取代
+        api.post("/events", json={
+            "event_id": "pbe-v", "cargo_id": bc,
+            "occurred_at": "2026-10-11T12:30:00+08:00", "temperature": "3",
+        })
+        api.post("/vehicle-readings", json={
+            "reading_id": "pbr-1", "trip_id": bt,
+            "read_at": "2026-10-11T12:30:00+08:00", "temperature": "9",
+        })
+        api.post("/events", json={
+            "event_id": "pbe-h", "cargo_id": bc,
+            "occurred_at": "2026-10-11T14:00:00+08:00",
+            "giver": "北京冷库", "receiver": "上海冷库",
+        })
+        params = {
+            "start_at": "2026-10-11T06:00:00+08:00",
+            "end_at": "2026-10-11T20:00:00+08:00",
+            "max_gap_seconds": "7200",
+        }
+        blind = api.get(f"/cargo/{bc}/blind-spots", params=params).json()
+        print("\n== 测温盲区（阈值 2 小时；故障隔离生效） ==")
+        for b in blind["blind_spots"]:
+            def _src(r):
+                if not r:
+                    return "边界(无)"
+                return ("自有:" + r["event_id"]
+                        if r["source"] == "own" else "车载:" + r["reading_id"])
+            print("   ", b["start"][11:16], "-", b["end"][11:16],
+                  b["duration_seconds"], "秒；",
+                  _src(b["start_reading"]), "->", _src(b["end_reading"]))
+            for p in b["custody_pieces"]:
+                print("       ", p["start"][11:16], "-", p["end"][11:16],
+                      p["responsible_party"])
+        # 撤销故障 -> 09:30 读数恢复覆盖，按当前状态重算（不改原记录）
+        api.post(f"/trips/{bt}/probe-faults/revoke", json={
+            "revocation_id": "pbrv-1", "fault_id": "pbf-1",
+            "expected_version": 0,
+        })
+        blind = api.get(f"/cargo/{bc}/blind-spots", params=params).json()
+        print("\n== 撤销故障后重算 ==")
+        print("    盲区数 =", len(blind["blind_spots"]),
+              [(b["start"][11:16], b["end"][11:16])
+               for b in blind["blind_spots"]])
+        # 非法参数：阈值非正 / 无时区 / 货物不存在
+        bad_window = dict(params)
+        bad_window["max_gap_seconds"] = "0"
+        print("\n== 盲区查询参数校验 ==")
+        print("    阈值 0 ->",
+              api.get(f"/cargo/{bc}/blind-spots", params=bad_window).status_code)
+        print("    货物不存在 ->",
+              api.get("/cargo/NO-SUCH-CARGO/blind-spots", params=params).status_code)
+
 
 if __name__ == "__main__":
     main()

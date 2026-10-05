@@ -1063,3 +1063,73 @@ import json,sys
 c = json.load(sys.stdin)["content"]
 print("    原封存包不变：标准版本 =", [s["version"] for s in c["temp_standards"]],
       "m1 上限 =", next(e["temp_upper_limit"] for e in c["own_events"] if e["event_id"]=="sc2-m1"))'
+
+echo "80) 质控：测温盲区查询（货物 + 带时区查询窗 + 最大允许无有效测温时长）"
+BC=C-BLIND
+BT=T-BLIND
+curl -sS -o /dev/null -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$BC\", \"started_at\": \"2026-10-11T06:00:00+08:00\",
+  \"temp_upper_limit\": \"4\", \"initial_holder\": \"北京冷库\"}"
+curl -sS -o /dev/null -X POST "$BASE/trips" -H 'Content-Type: application/json' \
+  -d "{\"trip_id\": \"$BT\", \"vehicle_no\": \"京B-盲\"}"
+curl -sS -o /dev/null -X POST "$BASE/trips/$BT/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [{\"cargo_id\": \"$BC\",
+    \"loaded_at\": \"2026-10-11T08:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-11T18:00:00+08:00\"}]}"
+# 有效读数：08:00 装车点车载、12:30 同刻自有（车载被取代）；09:30 的读数被故障隔离
+curl -sS -o /dev/null -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d \
+  "{\"reading_id\":\"br-0\",\"trip_id\":\"$BT\",\"read_at\":\"2026-10-11T08:00:00+08:00\",\"temperature\":\"3\"}"
+curl -sS -o /dev/null -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d \
+  "{\"reading_id\":\"br-q\",\"trip_id\":\"$BT\",\"read_at\":\"2026-10-11T09:30:00+08:00\",\"temperature\":\"3\"}"
+curl -sS -o /dev/null -X POST "$BASE/trips/$BT/probe-faults" -H 'Content-Type: application/json' -d "{
+  \"fault_id\": \"bf-1\", \"fault_start\": \"2026-10-11T09:00:00+08:00\",
+  \"fault_end\": \"2026-10-11T10:00:00+08:00\", \"reason\": \"探头校准漂移\"}"
+curl -sS -o /dev/null -X POST "$BASE/events" -H 'Content-Type: application/json' -d \
+  "{\"event_id\":\"be-v\",\"cargo_id\":\"$BC\",\"occurred_at\":\"2026-10-11T12:30:00+08:00\",\"temperature\":\"3\"}"
+curl -sS -o /dev/null -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d \
+  "{\"reading_id\":\"br-1\",\"trip_id\":\"$BT\",\"read_at\":\"2026-10-11T12:30:00+08:00\",\"temperature\":\"9\"}"
+# 14:00 交接北京冷库 -> 上海冷库（交接点归接收方，仅用于保管方片段切分）
+curl -sS -o /dev/null -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\":\"be-h\",\"cargo_id\":\"$BC\",\"occurred_at\":\"2026-10-11T14:00:00+08:00\",
+  \"giver\": \"北京冷库\", \"receiver\": \"上海冷库\"}"
+echo "    查询窗 06:00-20:00（+08:00），阈值 2 小时 -> 严格长于 2h 的间隔为盲区："
+curl -sS -G "$BASE/cargo/$BC/blind-spots" \
+  --data-urlencode "start_at=2026-10-11T06:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-11T20:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=7200" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+print("    阈值(秒) =", d["max_gap_seconds"])
+for b in d["blind_spots"]:
+    src = lambda r: ("自有:"+r["event_id"]) if r and r["source"]=="own" \
+        else (("车载:"+r["reading_id"]) if r else "边界(无)")
+    print("    盲区", b["start"][11:16], "-", b["end"][11:16],
+          b["duration_seconds"], "秒；", src(b["start_reading"]), "->", src(b["end_reading"]))
+    for p in b["custody_pieces"]:
+        print("       保管方片段", p["start"][11:16], "-", p["end"][11:16],
+              p["responsible_party"])'
+echo "    撤销故障后 br-q 恢复覆盖，按当前状态重算（原记录不改）："
+curl -sS -o /dev/null -X POST "$BASE/trips/$BT/probe-faults/revoke" \
+  -H 'Content-Type: application/json' -d \
+  '{"revocation_id":"brv-1","fault_id":"bf-1","expected_version":0}'
+curl -sS -G "$BASE/cargo/$BC/blind-spots" \
+  --data-urlencode "start_at=2026-10-11T06:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-11T20:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=7200" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+print("    盲区数 =", len(d["blind_spots"]),
+      [(b["start"][11:16], b["end"][11:16]) for b in d["blind_spots"]])'
+echo "    非法参数：阈值 0 / 无时区 / 起止倒置 / 货物不存在 -> 422 / 404"
+curl -sS -o /dev/null -w "    阈值 0        HTTP %{http_code}\n" -G "$BASE/cargo/$BC/blind-spots" \
+  --data-urlencode "start_at=2026-10-11T06:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-11T20:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=0"
+curl -sS -o /dev/null -w "    缺时区        HTTP %{http_code}\n" -G "$BASE/cargo/$BC/blind-spots" \
+  --data-urlencode "start_at=2026-10-11T06:00:00" \
+  --data-urlencode "end_at=2026-10-11T20:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=7200"
+curl -sS -o /dev/null -w "    货物不存在    HTTP %{http_code}\n" -G "$BASE/cargo/NO-SUCH-CARGO/blind-spots" \
+  --data-urlencode "start_at=2026-10-11T06:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-11T20:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=7200"
